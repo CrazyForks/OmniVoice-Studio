@@ -39,7 +39,8 @@ dependencies = [
     "tensorboardX",
     "webdataset",
     "numpy",
-    "soundfile"
+    "soundfile",
+    "psutil>=7.2.2",
 ]
 
 [project.optional-dependencies]

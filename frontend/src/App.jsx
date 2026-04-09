@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import './index.css';
+import { Toaster, toast } from 'react-hot-toast';
 import ALL_LANGUAGES from './languages.json';
 import { 
   Sparkles, Fingerprint, Wand2, SlidersHorizontal, UserSquare2, ShieldCheck, 
@@ -33,15 +34,38 @@ const PRESETS = [
   { id: 'sichuan', name: '🌶️ 四川话', tags: '', attrs: {Gender:'female', Age:'young adult', Pitch:'moderate pitch', Style:'Auto', EnglishAccent:'Auto', ChineseDialect:'四川话'} },
 ];
 
-// Common ISO 639-1 codes for YouTube dubbing
 const LANG_CODES = [
-  {code:'en', label:'English'}, {code:'es', label:'Spanish'}, {code:'fr', label:'French'},
-  {code:'de', label:'German'}, {code:'it', label:'Italian'}, {code:'pt', label:'Portuguese'},
-  {code:'ru', label:'Russian'}, {code:'ja', label:'Japanese'}, {code:'ko', label:'Korean'},
-  {code:'zh', label:'Chinese'}, {code:'ar', label:'Arabic'}, {code:'hi', label:'Hindi'},
-  {code:'tr', label:'Turkish'}, {code:'pl', label:'Polish'}, {code:'nl', label:'Dutch'},
-  {code:'sv', label:'Swedish'}, {code:'th', label:'Thai'}, {code:'vi', label:'Vietnamese'},
-  {code:'id', label:'Indonesian'}, {code:'uk', label:'Ukrainian'},
+  {code: 'af', label: 'Afrikaans'}, {code: 'sq', label: 'Albanian'}, {code: 'am', label: 'Amharic'},
+  {code: 'ar', label: 'Arabic'}, {code: 'hy', label: 'Armenian'}, {code: 'az', label: 'Azerbaijani'},
+  {code: 'eu', label: 'Basque'}, {code: 'be', label: 'Belarusian'}, {code: 'bn', label: 'Bengali'},
+  {code: 'bs', label: 'Bosnian'}, {code: 'bg', label: 'Bulgarian'}, {code: 'my', label: 'Burmese'},
+  {code: 'ca', label: 'Catalan'}, {code: 'cmn-Hans', label: 'Chinese (Simplified)'}, {code: 'cmn-Hant', label: 'Chinese (Traditional)'},
+  {code: 'hr', label: 'Croatian'}, {code: 'cs', label: 'Czech'}, {code: 'da', label: 'Danish'},
+  {code: 'nl', label: 'Dutch'}, {code: 'en', label: 'English'}, {code: 'et', label: 'Estonian'},
+  {code: 'fi', label: 'Finnish'}, {code: 'fr', label: 'French'}, {code: 'gl', label: 'Galician'},
+  {code: 'ka', label: 'Georgian'}, {code: 'de', label: 'German'}, {code: 'el', label: 'Greek'},
+  {code: 'gu', label: 'Gujarati'}, {code: 'ht', label: 'Haitian Creole'}, {code: 'ha', label: 'Hausa'},
+  {code: 'haw', label: 'Hawaiian'}, {code: 'he', label: 'Hebrew'}, {code: 'hi', label: 'Hindi'},
+  {code: 'hu', label: 'Hungarian'}, {code: 'is', label: 'Icelandic'}, {code: 'id', label: 'Indonesian'},
+  {code: 'it', label: 'Italian'}, {code: 'ja', label: 'Japanese'}, {code: 'jw', label: 'Javanese'},
+  {code: 'kn', label: 'Kannada'}, {code: 'kk', label: 'Kazakh'}, {code: 'km', label: 'Khmer'},
+  {code: 'ko', label: 'Korean'}, {code: 'ku', label: 'Kurdish'}, {code: 'ky', label: 'Kyrgyz'},
+  {code: 'lo', label: 'Lao'}, {code: 'la', label: 'Latin'}, {code: 'lv', label: 'Latvian'},
+  {code: 'lt', label: 'Lithuanian'}, {code: 'mk', label: 'Macedonian'}, {code: 'ms', label: 'Malay'},
+  {code: 'ml', label: 'Malayalam'}, {code: 'mt', label: 'Maltese'}, {code: 'mi', label: 'Maori'},
+  {code: 'mr', label: 'Marathi'}, {code: 'mn', label: 'Mongolian'}, {code: 'ne', label: 'Nepali'},
+  {code: 'no', label: 'Norwegian'}, {code: 'ps', label: 'Pashto'}, {code: 'fa', label: 'Persian'},
+  {code: 'pl', label: 'Polish'}, {code: 'pt', label: 'Portuguese'}, {code: 'pa', label: 'Punjabi'},
+  {code: 'ro', label: 'Romanian'}, {code: 'ru', label: 'Russian'}, {code: 'sm', label: 'Samoan'},
+  {code: 'gd', label: 'Scots Gaelic'}, {code: 'sr', label: 'Serbian'}, {code: 'sn', label: 'Shona'},
+  {code: 'sd', label: 'Sindhi'}, {code: 'si', label: 'Sinhala'}, {code: 'sk', label: 'Slovak'},
+  {code: 'sl', label: 'Slovenian'}, {code: 'so', label: 'Somali'}, {code: 'es', label: 'Spanish'},
+  {code: 'su', label: 'Sundanese'}, {code: 'sw', label: 'Swahili'}, {code: 'sv', label: 'Swedish'},
+  {code: 'tg', label: 'Tajik'}, {code: 'ta', label: 'Tamil'}, {code: 'te', label: 'Telugu'},
+  {code: 'th', label: 'Thai'}, {code: 'tr', label: 'Turkish'}, {code: 'uk', label: 'Ukrainian'},
+  {code: 'ur', label: 'Urdu'}, {code: 'uz', label: 'Uzbek'}, {code: 'vi', label: 'Vietnamese'},
+  {code: 'cy', label: 'Welsh'}, {code: 'xh', label: 'Xhosa'}, {code: 'yi', label: 'Yiddish'},
+  {code: 'yo', label: 'Yoruba'}, {code: 'zu', label: 'Zulu'}
 ];
 
 const API = "http://localhost:8000";
@@ -112,6 +136,20 @@ function App() {
   const [makeDefaultTrack, setMakeDefaultTrack] = useState(true);
 
   // ── LOAD DATA FROM SERVER ──
+  const [sysStats, setSysStats] = useState(null);
+
+  useEffect(() => {
+    const fetchStats = async () => {
+      try {
+        const res = await fetch(`${API}/sysinfo`);
+        if (res.ok) setSysStats(await res.json());
+      } catch (e) {}
+    };
+    fetchStats();
+    const interval = setInterval(fetchStats, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
   const loadProfiles = useCallback(async () => {
     try {
       const res = await fetch(`${API}/profiles`);
@@ -180,8 +218,8 @@ function App() {
   };
 
   const handleGenerate = async () => {
-    if (!text.trim()) return alert("Please enter text");
-    if (mode === 'clone' && !refAudio && !selectedProfile) return alert("Upload an audio or select a voice profile");
+    if (!text.trim()) return toast.error("Please enter text");
+    if (mode === 'clone' && !refAudio && !selectedProfile) return toast.error("Upload an audio or select a voice profile");
     setIsGenerating(true);
     setGenerationTime(0);
     const st = Date.now();
@@ -221,7 +259,7 @@ function App() {
       // Refresh history from server
       await loadHistory();
     } catch (err) {
-      alert("Error: " + err.message);
+      toast.error("Error: " + err.message);
     } finally {
       clearInterval(timerRef.current);
       setIsGenerating(false);
@@ -230,7 +268,7 @@ function App() {
 
   // ── PROFILES ──
   const handleSaveProfile = async () => {
-    if (!profileName.trim() || !refAudio) return alert("Need a name and reference audio");
+    if (!profileName.trim() || !refAudio) return toast.error("Need a name and reference audio");
     const formData = new FormData();
     formData.append("name", profileName);
     formData.append("ref_audio", refAudio);
@@ -243,7 +281,7 @@ function App() {
       setShowSaveProfile(false);
       setProfileName('');
       await loadProfiles();
-    } catch (e) { alert(e.message); }
+    } catch (e) { toast.error(e.message); }
   };
 
   const handleDeleteProfile = async (id) => {
@@ -388,13 +426,34 @@ function App() {
 
   return (
     <div className="app-container">
+      <Toaster position="top-center" toastOptions={{
+        style: { background: 'rgba(40,40,40,0.8)', backdropFilter: 'blur(10px)', color: '#ebdbb2', border: '1px solid rgba(255,255,255,0.1)' },
+        error: { iconTheme: { primary: '#fb4934', secondary: '#fff' } },
+        success: { iconTheme: { primary: '#b8bb26', secondary: '#fff' } }
+      }}/>
       <div className="main-content">
-        <div className="header-area">
-          <ShieldCheck color="#d3869b" size={24}/>
-          <div>
-            <h1>OmniVoice Studio</h1>
-            <p>646 languages · Clone · Design · Video Dubbing</p>
+        <div className="header-area" style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+          <div style={{display: 'flex', alignItems: 'center', gap: '12px'}}>
+            <ShieldCheck color="#d3869b" size={24}/>
+            <div>
+              <h1>OmniVoice Studio</h1>
+              <p>646 languages · Clone · Design · Video Dubbing</p>
+            </div>
           </div>
+          {sysStats && (
+            <div style={{display: 'flex', gap: '16px', fontSize: '0.75rem', color: '#a89984', background: 'rgba(0,0,0,0.3)', padding: '6px 12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)'}}>
+              <div style={{display: 'flex', flexDirection: 'column'}}>
+                <span style={{fontWeight: 600, color: '#ebdbb2'}}>RAM: {sysStats.ram.toFixed(1)} / {sysStats.total_ram.toFixed(1)} GB</span>
+                <span>CPU: {sysStats.cpu.toFixed(1)}%</span>
+              </div>
+              <div style={{display: 'flex', flexDirection: 'column', borderLeft: '1px solid rgba(255,255,255,0.1)', paddingLeft: '16px'}}>
+                <span style={{fontWeight: 600, color: sysStats.gpu_active ? '#8ec07c' : '#ebdbb2'}}>
+                  GPU VRAM: {sysStats.vram.toFixed(1)} GB
+                </span>
+                <span>Status: {sysStats.gpu_active ? <span style={{color: '#8ec07c'}}>Active</span> : 'Idle'}</span>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="tabs">

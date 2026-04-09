@@ -9,6 +9,7 @@ import asyncio
 import subprocess
 import logging
 import time
+import psutil
 from contextlib import asynccontextmanager
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
@@ -39,13 +40,21 @@ DB_PATH = os.path.join(DATA_DIR, "omnivoice.db")
 for d in [DATA_DIR, VOICES_DIR, OUTPUTS_DIR, DUB_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# Ensure ffmpeg is on PATH for Whisper and other subprocesses
-for _fpath in ["/opt/homebrew/bin", "/usr/local/bin"]:
-    if _fpath not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = _fpath + ":" + os.environ.get("PATH", "")
+import sys
+
+# Ensure ffmpeg is on PATH for Whisper and other subprocesses (mostly relevant for Mac/Linux)
+if sys.platform != "win32":
+    for _fpath in ["/opt/homebrew/bin", "/usr/local/bin"]:
+        if _fpath not in os.environ.get("PATH", "") and os.path.exists(_fpath):
+            os.environ["PATH"] = _fpath + os.pathsep + os.environ.get("PATH", "")
 
 model: Optional[OmniVoice] = None
-_inference_pool = ThreadPoolExecutor(max_workers=1)
+_model_lock = asyncio.Lock()
+_last_used = time.time()
+_IDLE_TIMEOUT_SECONDS = 300  # 5 minutes
+
+_gpu_pool = ThreadPoolExecutor(max_workers=1)
+_cpu_pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 _dub_jobs = {}
 
 
@@ -113,31 +122,56 @@ def get_best_device():
     return "cpu"
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def _load_model_sync():
     global model
-    _init_db()
     device = get_best_device()
-    print(f"Loading OmniVoice model on device: {device}...")
+    print(f"Loading OmniVoice model lazily on device: {device}...")
     checkpoint = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
-    model = OmniVoice.from_pretrained(
+    _model = OmniVoice.from_pretrained(
         checkpoint, device_map=device, dtype=torch.float16, load_asr=True,
     )
-
-    # Skip MPS warmup — it consumes too much memory on Apple Silicon
-    # and the first real inference will warm things up naturally
-
-    # Only apply torch.compile on CUDA (MPS compile causes GPU thrashing)
     try:
         if device == "cuda":
-            model.llm = torch.compile(model.llm, mode="reduce-overhead")
+            _model.llm = torch.compile(_model.llm, mode="reduce-overhead")
             print("torch.compile applied.")
     except Exception as e:
         print(f"torch.compile skipped: {e}")
-
     print("OmniVoice model loaded successfully.")
+    return _model
+
+async def get_model() -> OmniVoice:
+    global model, _last_used
+    _last_used = time.time()
+    if model is not None:
+        return model
+    
+    async with _model_lock:
+        if model is None:
+            loop = asyncio.get_running_loop()
+            model = await loop.run_in_executor(_gpu_pool, _load_model_sync)
+    return model
+
+async def _idle_worker():
+    global model
+    while True:
+        await asyncio.sleep(30)
+        async with _model_lock:
+            if model is not None and time.time() - _last_used > _IDLE_TIMEOUT_SECONDS:
+                print("Idle timeout reached. Unloading OmniVoice model to free VRAM...")
+                model = None
+                import gc
+                gc.collect()
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                elif torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _init_db()
+    idle_task = asyncio.create_task(_idle_worker())
     yield
-    model = None
+    idle_task.cancel()
 
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -154,14 +188,44 @@ app.add_middleware(
 # Serve generated audio files statically
 app.mount("/audio", StaticFiles(directory=OUTPUTS_DIR), name="audio")
 app.mount("/voice_audio", StaticFiles(directory=VOICES_DIR), name="voice_audio")
+# ═══════════════════════════════════════════════════════════════════════
+# SYSTEM STATS
+# ═══════════════════════════════════════════════════════════════════════
 
+@app.get("/sysinfo")
+def get_sys_info():
+    vram = 0.0
+    gpu_active = False
+    
+    # Safely handle cross-platform (Mac Apple Silicon, Windows/Linux NVIDIA, CPU-only)
+    is_mac = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    is_cuda = torch.cuda.is_available()
+
+    try:
+        if is_mac:
+            vram = torch.mps.current_allocated() / (1024**3)
+        elif is_cuda:
+            vram = torch.cuda.memory_allocated() / (1024**3)
+    except Exception:
+        pass # Graceful fallback if unsupported PyTorch backend version
+        
+    if vram > 0.1:
+        gpu_active = True
+
+    return {
+        "cpu": psutil.cpu_percent(interval=0.1),
+        "ram": psutil.virtual_memory().used / (1024**3),
+        "total_ram": psutil.virtual_memory().total / (1024**3),
+        "vram": vram,
+        "gpu_active": gpu_active
+    }
 
 # ═══════════════════════════════════════════════════════════════════════
 # VOICE PROFILES (SQLite + disk)
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.get("/profiles")
-async def list_profiles():
+def list_profiles():
     conn = _get_db()
     rows = conn.execute("SELECT * FROM voice_profiles ORDER BY created_at DESC").fetchall()
     conn.close()
@@ -196,7 +260,7 @@ async def create_profile(
 
 
 @app.delete("/profiles/{profile_id}")
-async def delete_profile(profile_id: str):
+def delete_profile(profile_id: str):
     conn = _get_db()
     row = conn.execute("SELECT ref_audio_path FROM voice_profiles WHERE id=?", (profile_id,)).fetchone()
     if row and row["ref_audio_path"]:
@@ -214,7 +278,7 @@ async def delete_profile(profile_id: str):
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.get("/history")
-async def list_history():
+def list_history():
     conn = _get_db()
     rows = conn.execute("SELECT * FROM generation_history ORDER BY created_at DESC LIMIT 50").fetchall()
     conn.close()
@@ -222,7 +286,7 @@ async def list_history():
 
 
 @app.delete("/history")
-async def clear_history():
+def clear_history():
     conn = _get_db()
     rows = conn.execute("SELECT audio_path FROM generation_history").fetchall()
     for r in rows:
@@ -237,7 +301,7 @@ async def clear_history():
 
 
 @app.get("/dub/history")
-async def list_dub_history():
+def list_dub_history():
     conn = _get_db()
     rows = conn.execute("SELECT * FROM dub_history ORDER BY created_at DESC LIMIT 30").fetchall()
     conn.close()
@@ -285,8 +349,7 @@ async def generate_speech(
     class_temperature: float = Form(0.0),
     profile_id: Optional[str] = Form(None),
 ):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    _model = await get_model()
 
     ref_audio_path = None
     cleanup_ref = False
@@ -317,7 +380,7 @@ async def generate_speech(
     try:
         loop = asyncio.get_event_loop()
         audio_tensor = await loop.run_in_executor(
-            _inference_pool, _run_inference,
+            _gpu_pool, _run_inference,
             text, language, ref_audio_path, ref_text, instruct, duration,
             num_step, guidance_scale, speed, t_shift, denoise,
             postprocess_output, layer_penalty_factor, position_temperature,
@@ -390,20 +453,28 @@ async def dub_upload(video: UploadFile = File(...)):
     audio_path = os.path.join(job_dir, "audio.wav")
     ffmpeg = _find_ffmpeg()
     try:
-        subprocess.run([
+        proc = await asyncio.create_subprocess_exec(
             ffmpeg, "-i", video_path, "-vn", "-acodec", "pcm_s16le",
-            "-ar", "16000", "-ac", "1", audio_path, "-y"
-        ], check=True, capture_output=True, timeout=120)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {e.stderr.decode()}")
+            "-ar", "16000", "-ac", "1", audio_path, "-y",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise Exception(stderr.decode())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {str(e)}")
 
     ffprobe = _find_ffprobe()
     try:
-        result = subprocess.run([
+        proc = await asyncio.create_subprocess_exec(
             ffprobe, "-v", "error", "-show_entries", "format=duration",
-            "-of", "json", video_path
-        ], capture_output=True, text=True, timeout=30)
-        dur = float(json.loads(result.stdout)["format"]["duration"])
+            "-of", "json", video_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            raise Exception("ffprobe failed")
+        dur = float(json.loads(stdout.decode())["format"]["duration"])
     except Exception:
         dur = 0.0
 
@@ -411,11 +482,15 @@ async def dub_upload(video: UploadFile = File(...)):
     vocals_path = os.path.join(job_dir, "vocals.wav")
     no_vocals_path = os.path.join(job_dir, "no_vocals.wav")
     try:
-        # Run demucs CLI to strictly output 2 stems
-        subprocess.run([
-            "uv", "run", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-d", "mps",
-            audio_path, "-o", job_dir
-        ], check=True, capture_output=True, timeout=300)
+        # Run demucs CLI asynchronously to strictly output 2 stems
+        proc = await asyncio.create_subprocess_exec(
+            "uv", "run", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-d", get_best_device(),
+            audio_path, "-o", job_dir,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise Exception(stderr.decode())
         
         # Demucs creates an output structure: htdemucs/audio/vocals.wav
         demucs_out = os.path.join(job_dir, "htdemucs", "audio")
@@ -461,7 +536,8 @@ async def dub_transcribe(job_id: str):
     job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if model is None or model._asr_pipe is None:
+    _model = await get_model()
+    if _model._asr_pipe is None:
         raise HTTPException(status_code=503, detail="ASR not loaded")
 
     def _transcribe():
@@ -473,10 +549,12 @@ async def dub_transcribe(job_id: str):
             audio_np = audio_np.mean(axis=1)
         audio_input = {"array": audio_np, "sampling_rate": sr}
 
-        # Use chunk-level timestamps (lightweight on MPS) then split into sentences
-        result = model._asr_pipe(
+        bs = 16 if torch.cuda.is_available() else (8 if torch.backends.mps.is_available() else 4)
+
+        # Use chunk-level timestamps
+        result = _model._asr_pipe(
             audio_input, return_timestamps=True,
-            chunk_length_s=15, batch_size=1,
+            chunk_length_s=15, batch_size=bs,
         )
 
         # Split chunks into sentences using punctuation
@@ -530,7 +608,7 @@ async def dub_transcribe(job_id: str):
         return segments
 
     loop = asyncio.get_event_loop()
-    segments = await loop.run_in_executor(_inference_pool, _transcribe)
+    segments = await loop.run_in_executor(_gpu_pool, _transcribe)
     job["segments"] = segments
     return {
         "job_id": job_id,
@@ -564,6 +642,8 @@ async def dub_generate(job_id: str, req: DubRequest):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    _model = await get_model()
+
     async def _stream():
         total = len(req.segments)
         all_segment_wavs = []
@@ -573,7 +653,7 @@ async def dub_generate(job_id: str, req: DubRequest):
 
             seg_duration = seg.end - seg.start
             if seg_duration <= 0.05 or not seg.text.strip():
-                sr = model.sampling_rate
+                sr = _model.sampling_rate
                 silence = torch.zeros(1, int(seg_duration * sr))
                 all_segment_wavs.append((seg.start, seg.end, silence, sr))
                 continue
@@ -591,7 +671,7 @@ async def dub_generate(job_id: str, req: DubRequest):
                         ref_text = row["ref_text"]
                         if not instruct_str:
                             instruct_str = row["instruct"]
-                return model.generate(
+                return _model.generate(
                     text=text, language=lang if lang != "Auto" else None,
                     ref_audio=ref_audio, ref_text=ref_text,
                     instruct=instruct_str if instruct_str else None,
@@ -606,22 +686,22 @@ async def dub_generate(job_id: str, req: DubRequest):
             loop = asyncio.get_event_loop()
             try:
                 audio_tensor = await loop.run_in_executor(
-                    _inference_pool, _gen,
+                    _gpu_pool, _gen,
                     seg.text, req.language, seg_instruct, seg_duration,
                     req.num_step, req.guidance_scale, req.speed, seg_profile,
                 )
                 # Save individual segment WAV for preview
                 seg_wav_path = os.path.join(DUB_DIR, job_id, f"seg_{i}.wav")
-                torchaudio.save(seg_wav_path, audio_tensor, model.sampling_rate)
-                all_segment_wavs.append((seg.start, seg.end, audio_tensor, model.sampling_rate))
+                torchaudio.save(seg_wav_path, audio_tensor, _model.sampling_rate)
+                all_segment_wavs.append((seg.start, seg.end, audio_tensor, _model.sampling_rate))
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'error', 'segment': i, 'error': str(e)})}\n\n"
-                sr = model.sampling_rate
+                sr = _model.sampling_rate
                 all_segment_wavs.append((seg.start, seg.end, torch.zeros(1, int(seg_duration * sr)), sr))
 
         yield f"data: {json.dumps({'type': 'assembling'})}\n\n"
 
-        sr = model.sampling_rate
+        sr = _model.sampling_rate
         total_samples = int(job["duration"] * sr)
         full_audio = torch.zeros(1, total_samples)
 
@@ -744,9 +824,15 @@ async def dub_download(job_id: str, preserve_bg: bool = Query(True, description=
     cmd += ["-shortest", output_path, "-y"]
 
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"ffmpeg mux failed: {e.stderr.decode()}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise Exception(stderr.decode())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ffmpeg mux failed: {str(e)}")
 
     base_name = os.path.splitext(job.get('filename', 'output'))[0]
     safe_name = ''.join(c for c in base_name if c.isalnum() or c in '-_ ').strip() or 'output'
@@ -781,20 +867,28 @@ async def dub_translate(req: TranslateRequest):
     from deep_translator import GoogleTranslator
 
     lang_code = TRANSLATE_CODES.get(req.target_lang, req.target_lang)
-
-    def _translate():
-        translator = GoogleTranslator(source="auto", target=lang_code)
-        results = []
-        for seg in req.segments:
-            try:
-                translated = translator.translate(seg["text"])
-                results.append({"id": seg["id"], "text": translated or seg["text"]})
-            except Exception as e:
-                results.append({"id": seg["id"], "text": seg["text"], "error": str(e)})
-        return results
-
     loop = asyncio.get_event_loop()
-    translated = await loop.run_in_executor(None, _translate)
+    from deep_translator import GoogleTranslator
+
+    def _translate_single(seg):
+        try:
+            # We instantiate translator inside the function because some translators aren't thread-safe
+            translator = GoogleTranslator(source="auto", target=lang_code)
+            translated = translator.translate(seg["text"])
+            return {"id": seg["id"], "text": translated or seg["text"]}
+        except Exception as e:
+            return {"id": seg["id"], "text": seg["text"], "error": str(e)}
+
+    # Run translations concurrently using the dedicated CPU/Network pool
+    tasks = [
+        loop.run_in_executor(_cpu_pool, _translate_single, seg) 
+        for seg in req.segments
+    ]
+    translated = await asyncio.gather(*tasks)
+
+    # Re-sort to maintain original order since gather returns in order anyway, but just in case
+    translated.sort(key=lambda x: x["id"])
+
     return {"translated": translated, "target_lang": req.target_lang}
 
 
@@ -853,10 +947,16 @@ async def dub_download_audio(job_id: str, lang: str = Query(None), preserve_bg: 
             "-map", "[aout]", "-c:a", "pcm_s16le", "-y", final_audio_path
         ]
         try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise Exception(stderr.decode())
             wav_path = final_audio_path
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to mix audio: {e.stderr.decode()}")
+        except Exception as e:
+            logger.error(f"Failed to mix audio: {str(e)}")
             
     base_name = os.path.splitext(job.get('filename', 'audio'))[0]
     safe_name = ''.join(c for c in base_name if c.isalnum() or c in '-_ ').strip() or 'audio'
