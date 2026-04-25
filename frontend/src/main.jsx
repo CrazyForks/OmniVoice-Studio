@@ -1,5 +1,6 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 // Fonts load before tokens so --font-* can resolve immediately (no FOUT).
 // Inter ships as a single variable file; Source Serif 4 too. Plex Mono has
 // no variable build so we pull the three weights we use (400/500/600).
@@ -15,8 +16,20 @@ import { installConsoleCapture } from './utils/consoleBuffer.js'
 
 installConsoleCapture();
 
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 10_000,        // 10s — avoids re-fetching on every mount
+      retry: 1,
+      refetchOnWindowFocus: false,
+    },
+  },
+});
+
 createRoot(document.getElementById('root')).render(
   <StrictMode>
-    <App />
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>
   </StrictMode>,
 )

@@ -6,7 +6,8 @@ import {
   FileAudio, UserPlus, MoreVertical,
 } from 'lucide-react';
 import { Button, Input } from '../ui';
-import { listCategories, listGalleryVoices, searchYoutube, downloadYoutubeClip, deleteGalleryVoice, saveVoiceAsProfile } from '../api/gallery';
+import { searchYoutube, downloadYoutubeClip, deleteGalleryVoice, saveVoiceAsProfile } from '../api/gallery';
+import { useGalleryCategories, useGalleryVoices } from '../api/hooks';
 import './VoiceGallery.css';
 
 // Check if running in Tauri
@@ -24,49 +25,29 @@ const CATEGORY_ICONS = {
 };
 
 export default function VoiceGallery() {
-  const [categories, setCategories] = useState([]);
-  const [voices, setVoices] = useState([]);
   const [selectedCategory, setSelectedCategory] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
-  const [isLoadingVoices, setIsLoadingVoices] = useState(false);
   const [playingVoiceId, setPlayingVoiceId] = useState(null);
   const [playingAudio, setPlayingAudio] = useState(null);
   const [viewMode, setViewMode] = useState('list');
 
-  useEffect(() => {
-    loadCategories();
-  }, []);
+  const { data: categories = [] } = useGalleryCategories();
+  
+  const queryParams = React.useMemo(() => {
+    const p = {};
+    if (selectedCategory) p.category = selectedCategory;
+    if (searchQuery.trim()) p.search = searchQuery.trim();
+    return p;
+  }, [selectedCategory, searchQuery]);
 
-  useEffect(() => {
-    loadVoices();
-  }, [selectedCategory]);
+  const voicesQuery = useGalleryVoices(queryParams);
+  const voices = voicesQuery.data || [];
+  const isLoadingVoices = voicesQuery.isLoading;
 
-  const loadCategories = async () => {
-    try {
-      const data = await listCategories();
-      setCategories(data);
-    } catch (e) {
-      console.error('Failed to load categories:', e);
-    }
-  };
-
-  const loadVoices = async () => {
-    setIsLoadingVoices(true);
-    try {
-      const params = {};
-      if (selectedCategory) params.category = selectedCategory;
-      if (searchQuery.trim()) params.search = searchQuery.trim();
-      const data = await listGalleryVoices(params);
-      setVoices(data || []);
-    } catch (e) {
-      console.error('Failed to load voices:', e);
-    } finally {
-      setIsLoadingVoices(false);
-    }
-  };
+  const loadVoices = () => voicesQuery.refetch();
 
   const handleSearch = async () => {
     setIsSearching(true);
@@ -204,7 +185,7 @@ export default function VoiceGallery() {
           <div className="header-text">
             <h2>Voice Gallery</h2>
           </div>
-          <Button variant="ghost" size="sm" onClick={() => loadVoices()} title="Reload">
+          <Button variant="ghost" size="sm" onClick={() => voicesQuery.refetch()} title="Reload">
             <RotateCcw size={14} />
           </Button>
         </div>

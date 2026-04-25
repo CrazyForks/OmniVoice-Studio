@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { CheckCircle, Loader, Sparkles, ArrowRight, AlertTriangle, XCircle, RefreshCw } from 'lucide-react';
+import { CheckCircle, Loader, ArrowRight, AlertTriangle, XCircle, RefreshCw } from 'lucide-react';
 import { Button } from '../ui';
-import { setupStatus, preflight } from '../api/setup';
+import { useSetupStatus, usePreflight } from '../api/hooks';
 import { ModelStoreTab, EnginesTab } from './Settings';
 import './SetupWizard.css';
 
@@ -74,31 +74,23 @@ function PreflightPanel({ report, loading, onRecheck }) {
  */
 export default function SetupWizard({ onReady }) {
   const [step, setStep] = useState(0);
-  const [status, setStatus] = useState(null);
-  const [pre, setPre] = useState(null);
-  const [preLoading, setPreLoading] = useState(false);
 
-  const reload = useCallback(async () => {
-    try { setStatus(await setupStatus()); }
-    catch { /* backend warming up — retry on interval */ }
-  }, []);
+  // TanStack Query — shared cache, auto-refetch on step 2 (models)
+  const setupQuery = useSetupStatus();
+  const preQuery   = usePreflight();
+  const status     = setupQuery.data ?? null;
+  const pre        = preQuery.data ?? null;
+  const preLoading = preQuery.isLoading;
 
-  const recheckPreflight = useCallback(async () => {
-    setPreLoading(true);
-    try { setPre(await preflight()); }
-    catch { /* backend not ready */ }
-    finally { setPreLoading(false); }
-  }, []);
-
-  useEffect(() => { reload(); recheckPreflight(); }, [reload, recheckPreflight]);
-
-  // Poll while on the Models step so the Finish button unlocks as soon as
-  // downloads complete, without the user having to click "Recheck".
+  // Poll setup status every 4s while on Models step so "Finish" unlocks
+  // as soon as downloads complete.
   useEffect(() => {
     if (step !== 2) return;
-    const iv = setInterval(reload, 4000);
+    const iv = setInterval(() => setupQuery.refetch(), 4000);
     return () => clearInterval(iv);
-  }, [step, reload]);
+  }, [step, setupQuery]);
+
+  const recheckPreflight = useCallback(() => { preQuery.refetch(); }, [preQuery]);
 
   const modelsReady = !!status?.models_ready;
   const preflightOk = !!pre?.ok;
@@ -110,8 +102,10 @@ export default function SetupWizard({ onReady }) {
         onDoubleClick={doubleClickMaximize}
         className="setup-wizard__hero"
       >
-        <Sparkles size={36} color="#d3869b" />
-        <h1 data-tauri-drag-region>Welcome to OmniVoice Studio</h1>
+        <div className="setup-wizard__brand">
+          <img src="/favicon.svg" alt="" className="setup-wizard__logo" />
+          <h1 data-tauri-drag-region>OmniVoice Studio</h1>
+        </div>
         <p className="setup-wizard__sub" data-tauri-drag-region>
           Dubbing, voice cloning, and voice design — all running locally on
           your machine. Four quick steps and you're in.
@@ -137,39 +131,48 @@ export default function SetupWizard({ onReady }) {
 
       {/* 0. Welcome */}
       {step === 0 && (
-        <div className="setup-wizard__embed" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <strong>What happens next</strong>
-          <ol style={{ margin: 0, paddingLeft: 20, lineHeight: 1.7, color: 'var(--color-fg-muted)', fontSize: '0.9rem' }}>
-            <li>
-              <strong>System check</strong> — we'll probe RAM, disk, GPU driver
-              compatibility, ffmpeg, and network. Any blockers flagged upfront so
-              nothing fails silently later.
-            </li>
-            <li>
-              <strong>Install models</strong> — we'll download ~5 GB of weights
-              (OmniVoice TTS + Whisper). Required ones first; optional engines
-              you can enable now or later.
-            </li>
-            <li>
-              <strong>Pick engines</strong> — choose which TTS / ASR / LLM
-              backends to use. Defaults work; power users can pin specific
-              engines per family.
-            </li>
-            <li>
-              <strong>You're in.</strong> First launch takes ~5-10 minutes to
-              download. After that, every launch is instant and fully offline.
-            </li>
-          </ol>
-          <div>
+        <>
+          <div className="setup-wizard__embed">
+            <div className="setup-wizard__welcome">
+              <div className="setup-wizard__welcome-grid">
+                <div className="setup-wizard__welcome-card">
+                  <span className="setup-wizard__welcome-num">1</span>
+                  <div>
+                    <strong>System check</strong>
+                    <p>Probe RAM, disk, GPU, ffmpeg, network. Blockers are flagged upfront.</p>
+                  </div>
+                </div>
+                <div className="setup-wizard__welcome-card">
+                  <span className="setup-wizard__welcome-num">2</span>
+                  <div>
+                    <strong>Install models</strong>
+                    <p>Download ~5 GB of weights — TTS + Whisper. Required models first, optional ones later.</p>
+                  </div>
+                </div>
+                <div className="setup-wizard__welcome-card">
+                  <span className="setup-wizard__welcome-num">3</span>
+                  <div>
+                    <strong>Pick engines</strong>
+                    <p>Choose TTS / ASR / LLM backends. Defaults work out of the box.</p>
+                  </div>
+                </div>
+              </div>
+              <p className="setup-wizard__welcome-note">
+                First run takes 5–10 minutes to download. After that, every launch is instant and fully offline.
+              </p>
+            </div>
+          </div>
+          <div className="setup-wizard__nav">
+            <span />
             <Button
-              variant="primary" size="lg"
+              variant="primary" size="sm"
               onClick={() => setStep(1)}
               trailing={<ArrowRight size={14} />}
             >
               Get started
             </Button>
           </div>
-        </div>
+        </>
       )}
 
       {/* 1. System check */}

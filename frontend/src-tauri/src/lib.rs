@@ -12,7 +12,12 @@ use tauri::{Emitter, Manager};
 // 8000 collides with Django/Rails/Jupyter/Airflow on most dev machines.
 // 3900 is the backend (FastAPI + uvicorn), 3901 is the Vite dev server,
 // 3902 is reserved for future IPC / websocket listeners.
-const BACKEND_PORT: u16 = 3900;
+fn backend_port() -> u16 {
+    std::env::var("OMNIVOICE_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3900)
+}
 
 // Version of the Astral `uv` binary we download at first run when no system
 // uv is on PATH. Pinned for reproducibility — bump alongside the uv.lock
@@ -727,7 +732,7 @@ fn spawn_backend<R: tauri::Runtime>(app: &tauri::AppHandle<R>, progress: Option<
             "--host",
             "127.0.0.1",
             "--port",
-            &BACKEND_PORT.to_string(),
+            &backend_port().to_string(),
         ])
         .stdout(stdout_file.map(Stdio::from).unwrap_or_else(Stdio::null))
         .stderr(stderr_file.map(Stdio::from).unwrap_or_else(Stdio::null))
@@ -772,6 +777,31 @@ pub fn run() {
                     .build(),
             )?;
 
+            // ── Enable microphone / camera on Linux (WebKitGTK) ──────────
+            // WebKitGTK has no browser-style permission dialog; it denies
+            // getUserMedia by default. We enable the media-stream setting
+            // and auto-grant UserMedia permission requests so the Record
+            // button works on all platforms.
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.with_webview(|webview| {
+                        use webkit2gtk::{WebViewExt, SettingsExt, PermissionRequestExt};
+                        let wk = webview.inner();
+                        if let Some(settings) = WebViewExt::settings(&wk) {
+                            settings.set_enable_media_stream(true);
+                            settings.set_enable_mediasource(true);
+                            settings.set_media_playback_requires_user_gesture(false);
+                            log::info!("WebKitGTK: media-stream enabled");
+                        }
+                        wk.connect_permission_request(|_, request| {
+                            request.allow();
+                            true
+                        });
+                    });
+                }
+            }
+
             // Bootstrap state is published via the `bootstrap_status` Tauri
             // command so the React splash can poll it while we work.
             let bootstrap = BootstrapState {
@@ -795,20 +825,20 @@ pub fn run() {
                     set_stage(&stage_handle, BootstrapStage::Ready);
                     return;
                 }
-                if backend_healthy(BACKEND_PORT) {
+                if backend_healthy(backend_port()) {
                     log::info!(
                         "Port {} already serving OmniVoice backend — attaching",
-                        BACKEND_PORT
+                        backend_port()
                     );
                     set_stage(&stage_handle, BootstrapStage::Ready);
                     return;
                 }
-                if port_in_use(BACKEND_PORT) {
+                if port_in_use(backend_port()) {
                     log::warn!(
                         "Port {} in use — taking ownership (killing whatever's there)",
-                        BACKEND_PORT
+                        backend_port()
                     );
-                    kill_orphan_on_port(BACKEND_PORT);
+                    kill_orphan_on_port(backend_port());
                     std::thread::sleep(Duration::from_millis(500));
                 }
                 let child = spawn_backend(&app_handle, Some(&stage_handle));
@@ -821,7 +851,7 @@ pub fn run() {
                 // we give it 3 min before declaring failure.
                 let start = std::time::Instant::now();
                 while start.elapsed() < Duration::from_secs(180) {
-                    if backend_healthy(BACKEND_PORT) {
+                    if backend_healthy(backend_port()) {
                         set_stage(&stage_handle, BootstrapStage::Ready);
                         return;
                     }

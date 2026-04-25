@@ -44,3 +44,4 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+webkit2gtk = "2.0"

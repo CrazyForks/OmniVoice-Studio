@@ -4,7 +4,8 @@ import {
   CheckCircle, AlertCircle, Plug, Mic, MessageSquare, Download, Copy,
 } from 'lucide-react';
 import { toast } from 'react-hot-toast';
-import { systemInfo, systemLogs, systemLogsTauri, clearSystemLogs, clearTauriLogs, modelStatus as fetchModelStatus, sysinfo as fetchSysinfo } from '../api/system';
+import { systemLogs, systemLogsTauri, clearSystemLogs, clearTauriLogs } from '../api/system';
+import { useSysinfo, useModelStatus, useSystemInfo } from '../api/hooks';
 import { listEngines, selectEngine } from '../api/engines';
 import { listModels, installModel, deleteModel, setupDownloadStreamUrl, getRecommendations } from '../api/setup';
 import { getFrontendLogs, clearFrontendLogs } from '../utils/consoleBuffer';
@@ -50,38 +51,41 @@ function fmtBytes(n) {
   return `${Math.round(n / 1024)} KB`;
 }
 
+/** Deterministic muted HSL color from an org/user name in a repo_id. */
+function orgColor(repoId) {
+  const org = (repoId || '').split('/')[0];
+  let h = 0;
+  for (let i = 0; i < org.length; i++) h = (h * 31 + org.charCodeAt(i)) & 0xffff;
+  return `hsl(${h % 360}, 35%, 28%)`;
+}
+
+import { useModels, useRecommendations, useInstallModel, useDeleteModel } from '../api/hooks';
+
 /**
  * Model store — list every known HF model, show install state, let the
  * user install / reinstall / delete individual models. Per-model download
  * progress is pulled from the shared /setup/download-stream SSE.
  */
 export function ModelStoreTab({ info, modelBadge }) {
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const modelsQuery = useModels();
+  const recoQuery = useRecommendations();
+  const data = modelsQuery.data;
+  const loading = modelsQuery.isLoading;
+  const reco = recoQuery.data;
+  const installMutation = useInstallModel();
+  const deleteMutation = useDeleteModel();
+
   const [busy, setBusy] = useState(new Set()); // repo_ids currently working
   // Per-repo active state. Tracks aggregate download across all files of
   // a running install so the row can show a determinate progress bar.
   // { [repo_id]: { phase, files: { [filename]: { downloaded, total, pct } }, error } }
   const [rowState, setRowState] = useState({});
   const [query, setQuery] = useState('');
-  const [reco, setReco] = useState(null);       // /setup/recommendations payload
   const [installingReco, setInstallingReco] = useState(false);
   const [activeRole, setActiveRole] = useState(null);
   const esRef = React.useRef(null);
-
-  const reload = useCallback(async () => {
-    setLoading(true);
-    try { setData(await listModels()); }
-    catch (e) { toast.error(`Failed to list models: ${e.message}`); }
-    finally { setLoading(false); }
-  }, []);
-
-  const reloadReco = useCallback(async () => {
-    try { setReco(await getRecommendations()); }
-    catch (e) { /* non-fatal — Recommendation card just hides */ void e; }
-  }, []);
-
-  useEffect(() => { reload(); reloadReco(); }, [reload, reloadReco]);
+  // Track download speed per repo: { [repo_id]: { lastBytes, lastTime, speed } }
+  const speedRef = React.useRef({});
 
   // Open the progress stream once when the tab mounts; close on unmount.
   useEffect(() => {
@@ -129,7 +133,10 @@ export function ModelStoreTab({ info, modelBadge }) {
       ['install_done', 'delete_done', 'install_error'].includes(s.phase));
     if (!term) return;
     const t = setTimeout(() => {
-      reload();
+      modelsQuery.refetch();
+      recoQuery.refetch();
+      // Clear stale speed data for this repo.
+      delete speedRef.current[term[0]];
       // Clear the terminal entry so the row reverts to the authoritative
       // `installed` flag from /models without keeping stale progress.
       setRowState(prev => {
@@ -139,14 +146,13 @@ export function ModelStoreTab({ info, modelBadge }) {
       });
     }, 800);
     return () => clearTimeout(t);
-  }, [rowState, reload]);
+  }, [rowState, modelsQuery, recoQuery]);
 
   const withBusy = async (repoId, fn, successMsg) => {
     setBusy(prev => new Set(prev).add(repoId));
     try {
       await fn();
       if (successMsg) toast.success(successMsg);
-      await reload();
     } catch (e) {
       toast.error(e.message || String(e));
     } finally {
@@ -154,16 +160,16 @@ export function ModelStoreTab({ info, modelBadge }) {
     }
   };
 
-  const onInstall = (repoId) => withBusy(repoId, () => installModel(repoId), 'Install started — progress in the row');
+  const onInstall = (repoId) => withBusy(repoId, () => installMutation.mutateAsync(repoId), 'Install started — progress in the row');
   const onDelete  = async (repoId) => {
     if (!(await askConfirm(`Delete ${repoId}? You can reinstall it later.`, 'Delete model'))) return;
-    return withBusy(repoId, () => deleteModel(repoId), `Deleted ${repoId}`);
+    return withBusy(repoId, () => deleteMutation.mutateAsync(repoId), `Deleted ${repoId}`);
   };
   const onReinstall = async (repoId) => {
     if (!(await askConfirm(`Reinstall ${repoId}? This will delete the current copy and download again.`, 'Reinstall model'))) return;
     await withBusy(repoId, async () => {
-      await deleteModel(repoId);
-      await installModel(repoId);
+      await deleteMutation.mutateAsync(repoId);
+      await installMutation.mutateAsync(repoId);
     }, 'Reinstalling');
   };
 
@@ -178,9 +184,8 @@ export function ModelStoreTab({ info, modelBadge }) {
     try {
       // Parallel install — backend /models/install spawns each download on
       // its own asyncio task so ordering doesn't matter.
-      await Promise.all(missing.map(m => installModel(m.repo_id)));
+      await Promise.all(missing.map(m => installMutation.mutateAsync(m.repo_id)));
       toast.success(`Started downloading ${missing.length} model${missing.length > 1 ? 's' : ''}`);
-      await Promise.all([reload(), reloadReco()]);
     } catch (e) {
       toast.error(`Install failed: ${e.message || e}`);
     } finally {
@@ -198,20 +203,25 @@ export function ModelStoreTab({ info, modelBadge }) {
   }
   if (!data) return null;
 
-  const groups = (data.models || []).reduce((acc, m) => {
+  const allModels = data.models || [];
+  const groups = allModels.reduce((acc, m) => {
     const k = (m.role || 'other').toLowerCase();
     (acc[k] = acc[k] || []).push(m);
     return acc;
   }, {});
   const ROLE_ORDER = ['tts', 'asr', 'diarisation', 'diarization', 'llm'];
-  const ROLE_LABEL = { tts: 'TTS', asr: 'ASR', diarisation: 'Diarisation', diarization: 'Diarisation', llm: 'LLM', other: 'Other' };
+  const ROLE_LABEL = { all: 'All', tts: 'TTS', asr: 'ASR', diarisation: 'Diarisation', diarization: 'Diarisation', llm: 'LLM', other: 'Other' };
   const roles = Object.keys(groups).sort((a, b) => {
     const ai = ROLE_ORDER.indexOf(a), bi = ROLE_ORDER.indexOf(b);
     return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
   });
-  const currentRole = activeRole && groups[activeRole] ? activeRole : roles[0];
+  // 'all' is a virtual role — shows every model regardless of category.
+  const currentRole = activeRole === 'all' ? 'all'
+    : activeRole && groups[activeRole] ? activeRole
+    : 'all';
   const q = query.trim().toLowerCase();
-  const rows = (currentRole ? groups[currentRole] : []).filter(m =>
+  const currentModels = currentRole === 'all' ? allModels : (groups[currentRole] || []);
+  const rows = currentModels.filter(m =>
     !q || m.repo_id.toLowerCase().includes(q) || (m.label || '').toLowerCase().includes(q));
 
   const COLUMNS = [
@@ -220,6 +230,8 @@ export function ModelStoreTab({ info, modelBadge }) {
     { key: 'status',  label: 'Status',  width: 110, align: 'center' },
     { key: 'actions', label: '',        width: 108, align: 'right' },
   ];
+
+  const allInstalled = allModels.filter(m => m.installed).length;
 
   return (
     <section className="settings-section settings-section--compact">
@@ -250,6 +262,15 @@ export function ModelStoreTab({ info, modelBadge }) {
           <div className="reco-banner__body">
             <div className="reco-banner__title">Recommended for {reco.device.label}</div>
             <div className="reco-banner__rationale">{reco.rationale}</div>
+            <div className="reco-banner__models">
+              {reco.models.map(m => (
+                <span key={m.repo_id} className={`reco-banner__model ${m.installed ? 'is-installed' : ''}`}>
+                  {m.installed ? '✓' : '○'} {m.label}
+                  <span className="reco-banner__model-size">{m.size_gb} GB</span>
+                  {m.required && <span className="reco-banner__model-req">required</span>}
+                </span>
+              ))}
+            </div>
           </div>
           <Button
             variant="primary"
@@ -264,21 +285,25 @@ export function ModelStoreTab({ info, modelBadge }) {
       )}
 
       <div className="models-controls">
-        {roles.length > 1 && (
-          <Segmented
-            size="sm"
-            value={currentRole}
-            onChange={setActiveRole}
-            className="models-roletabs"
-            items={roles.map(r => {
+        <Segmented
+          size="sm"
+          value={currentRole}
+          onChange={setActiveRole}
+          className="models-roletabs"
+          items={[
+            {
+              value: 'all',
+              label: `All ${allInstalled}/${allModels.length}`,
+            },
+            ...roles.map(r => {
               const installed = groups[r].filter(m => m.installed).length;
               return {
                 value: r,
                 label: `${ROLE_LABEL[r] || r.toUpperCase()} ${installed}/${groups[r].length}`,
               };
-            })}
-          />
-        )}
+            }),
+          ]}
+        />
         <input
           type="search"
           className="models-search"
@@ -309,10 +334,18 @@ export function ModelStoreTab({ info, modelBadge }) {
             const aggPct = totals.total > 0 ? (totals.downloaded / totals.total) * 100 : null;
             const showBar = phase === 'install_start' || phase === 'active' || phase === 'delete_start';
             const activeFilename = fileList.find(([, f]) => f.phase !== 'done')?.[0];
+            const unsupported = m.supported === false;
             return (
-              <div key={m.repo_id} className={`models-row ${m.installed ? 'is-ok' : 'is-off'}`}>
+              <div key={m.repo_id} className={`models-row ${m.installed ? 'is-ok' : 'is-off'}${unsupported ? ' is-unsupported' : ''}`}>
                 <div className="models-row__cell models-row__name" style={{ flex: 3 }}>
                   <span className="models-row__title">
+                    <span
+                      className="models-row__avatar"
+                      style={{ background: orgColor(m.repo_id) }}
+                      title={m.repo_id.split('/')[0]}
+                    >
+                      {m.repo_id.split('/')[0].slice(0, 2).toUpperCase()}
+                    </span>
                     {m.label}
                     {m.required && <span className="models-row__tag">required</span>}
                   </span>
@@ -331,7 +364,34 @@ export function ModelStoreTab({ info, modelBadge }) {
                         {isDeleting
                           ? 'Removing cached revisions…'
                           : hasFiles
-                            ? `${fmtBytes(totals.downloaded)}${totals.total ? ` / ${fmtBytes(totals.total)}` : ''} · ${fileList.length} file${fileList.length === 1 ? '' : 's'}${totals.done ? ` · ${totals.done} done` : ''}${activeFilename ? ` · ${activeFilename.split('/').pop()}` : ''}`
+                            ? (() => {
+                                // Compute speed from speedRef
+                                const sp = speedRef.current[m.repo_id];
+                                const now = Date.now();
+                                if (sp && totals.downloaded > 0) {
+                                  const dt = (now - sp.lastTime) / 1000;
+                                  if (dt >= 2) {
+                                    sp.speed = Math.max(0, (totals.downloaded - sp.lastBytes) / dt);
+                                    sp.lastBytes = totals.downloaded;
+                                    sp.lastTime = now;
+                                  }
+                                } else {
+                                  speedRef.current[m.repo_id] = { lastBytes: totals.downloaded, lastTime: now, speed: 0 };
+                                }
+                                const speed = sp?.speed || 0;
+                                const speedStr = speed > 0 ? ` · ${fmtBytes(speed)}/s` : '';
+                                const pctStr = aggPct != null ? ` (${Math.round(aggPct)}%)` : '';
+                                const parts = [
+                                  `${fmtBytes(totals.downloaded)}${totals.total ? ` / ${fmtBytes(totals.total)}` : ''}${pctStr}${speedStr}`,
+                                ];
+                                if (fileList.length > 1) {
+                                  parts.push(`${totals.done}/${fileList.length} files`);
+                                }
+                                if (activeFilename) {
+                                  parts.push(activeFilename.split('/').pop());
+                                }
+                                return parts.join(' · ');
+                              })()
                             : 'Preparing download…'}
                       </span>
                     </div>
@@ -352,10 +412,20 @@ export function ModelStoreTab({ info, modelBadge }) {
                         ? <Badge tone="warn" size="xs"><RefreshCw size={10} className="spinner" /> working</Badge>
                         : m.installed
                           ? <Badge tone="success" size="xs">installed</Badge>
-                          : <Badge tone="neutral" size="xs">not installed</Badge>}
+                          : unsupported
+                            ? <Badge tone="neutral" size="xs">{(m.platforms || []).join(', ')}</Badge>
+                            : <Badge tone="neutral" size="xs">not installed</Badge>}
                 </div>
                 <div className="models-row__cell models-row__actions" style={{ width: 108 }}>
-                  {!m.installed && !rowBusy && !isInstalling && (
+                  <Button
+                    variant="icon" iconSize="sm"
+                    onClick={() => window.open(`https://huggingface.co/${m.repo_id}`, '_blank')}
+                    title="View on HuggingFace"
+                    aria-label="View on HuggingFace"
+                  >
+                    <ExternalLink size={11} />
+                  </Button>
+                  {!m.installed && !rowBusy && !isInstalling && !unsupported && (
                     <Button
                       variant="subtle" size="sm"
                       onClick={() => onInstall(m.repo_id)}
@@ -539,16 +609,18 @@ async function askConfirm(message, title = 'Confirm') {
 
 export default function Settings() {
   const [activeTab, setActiveTab] = useState('models');
-  const [info, setInfo] = useState(null);
-  const [status, setStatus] = useState(null);
   const [logSource, setLogSource] = useState('backend');
   const [logs, setLogs] = useState([]);
   const [logMeta, setLogMeta] = useState({ path: '', exists: false });
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [appVersion, setAppVersion] = useState(null);
   const [tauriVersion, setTauriVersion] = useState(null);
-  const [hw, setHw] = useState(null);
   const [updateState, setUpdateState] = useState('idle'); // idle|checking|downloading|uptodate|error
+
+  // TanStack Query — shared cache with App.jsx, no duplicate requests
+  const { data: hw } = useSysinfo();
+  const { data: status } = useModelStatus();
+  const { data: info } = useSystemInfo();
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -561,18 +633,7 @@ export default function Settings() {
     })();
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    const pull = async () => {
-      try {
-        const s = await fetchSysinfo();
-        if (!cancelled) setHw(s);
-      } catch { /* backend not up yet */ }
-    };
-    pull();
-    const iv = setInterval(pull, 6000);
-    return () => { cancelled = true; clearInterval(iv); };
-  }, []);
+  // sysinfo polling is now handled by useSysinfo() hook above
 
   const copyDiagnostics = useCallback(async () => {
     const nav = typeof navigator !== 'undefined' ? navigator : {};
@@ -647,12 +708,8 @@ export default function Settings() {
     }
   }, []);
 
-  const refreshInfo = useCallback(async () => {
-    try {
-      const [i, s] = await Promise.all([systemInfo(), fetchModelStatus()]);
-      setInfo(i); setStatus(s);
-    } catch (e) { /* ignore */ }
-  }, []);
+  // refreshInfo polling replaced by TanStack Query (useSystemInfo + useModelStatus)
+  const refreshInfo = useCallback(() => {}, []);
 
   const refreshLogs = useCallback(async () => {
     setLoadingLogs(true);
@@ -680,12 +737,6 @@ export default function Settings() {
       setLoadingLogs(false);
     }
   }, [logSource]);
-
-  useEffect(() => {
-    refreshInfo();
-    const iv = setInterval(refreshInfo, 4000);
-    return () => clearInterval(iv);
-  }, [refreshInfo]);
 
   useEffect(() => {
     if (activeTab === 'logs') refreshLogs();
